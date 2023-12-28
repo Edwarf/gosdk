@@ -62,7 +62,14 @@ type DryClient struct {
 	DeleteEndpoint         string
 	RegisterProxyEndpoint  string
 	SubmitJobProxyEndpoint string
+	TenantSessionEndpoint  string
 	GetJobsProxyEndpoint   string
+	GetStateEndpoint       string
+	ConnectEndpoint        string
+	UpsertSecretEndpoint   string
+	DeleteSecretEndpoint   string
+	SyncEndpoint           string
+	OauthKeyEndpoint       string
 	APIKey                 string
 	Verbose                bool
 	Handlers               map[string]HandlerFunc
@@ -88,6 +95,13 @@ func NewDryClient(apiKey string, verbose bool, proxyIdentity *DryId, engineHost 
 		RegisterProxyEndpoint:  "/hire/*proxy_identity",
 		SubmitJobProxyEndpoint: "/retire/*job_id",
 		GetJobsProxyEndpoint:   "/employ/*proxy_identity",
+		TenantSessionEndpoint:  "/tenant/session",
+		GetStateEndpoint:       "/state/*identity",
+		ConnectEndpoint:        "/connect/*identity",
+		UpsertSecretEndpoint:   "/secret/upsert",
+		DeleteSecretEndpoint:   "/secret/remove",
+		SyncEndpoint:           "/sync/*identity",
+		OauthKeyEndpoint:       "/oauth/token/*identity",
 		APIKey:                 apiKey,
 		Verbose:                verbose,
 		Handlers:               make(map[string]HandlerFunc),
@@ -349,4 +363,159 @@ func (dc *DryClient) ProcessJobs(jobs []*DryJob) {
 		}(job)
 	}
 	wg.Wait()
+}
+
+func (dc *DryClient) TenantSession(tenantId string) (string, error) {
+	if len(tenantId) > 32 {
+		return "", fmt.Errorf("tenant ID must be less than or equal to 32 characters")
+	}
+
+	endpoint := fmt.Sprintf("%s%s", dc.EngineHost, dc.TenantSessionEndpoint)
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+		"Content-Type":  "application/json",
+	}
+
+	payload := map[string]string{"tenant_id": tenantId}
+	payloadBytes, _ := json.Marshal(payload)
+
+	resp, err := dc.doRequest("POST", endpoint, headers, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
+		var data map[string]string
+		if err := json.Unmarshal(body, &data); err != nil {
+			return "", err
+		}
+		dc.report(fmt.Sprintf("Successfully retrieved tenant session for tenant %s", tenantId))
+		return data["session_key"], nil
+	}
+
+	dc.report(fmt.Sprintf("Failed to retrieve tenant session for tenant %s with error: %s", tenantId, string(body)))
+	return "", fmt.Errorf("failed with status code: %d", resp.StatusCode)
+}
+
+func (dc *DryClient) State(dryId *DryId) (map[string]interface{}, error) {
+	dc.report(fmt.Sprintf("Retrieving state for trigger %s", dryId.String()))
+	endpoint := fmt.Sprintf("%s%s/%s", dc.EngineHost, dc.GetStateEndpoint, dryId.String())
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+	}
+
+	resp, err := dc.doRequest("GET", endpoint, headers, nil)
+	if err != nil {
+		dc.report(fmt.Sprintf("Failed to retrieve state for trigger %s with error: %v", dryId, err))
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == 200 {
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, err
+		}
+		dc.report(fmt.Sprintf("Successfully retrieved state for trigger %s", dryId))
+		return result, nil
+	}
+
+	dc.report(fmt.Sprintf("Failed to retrieve state for trigger %s with error: %s", dryId, string(body)))
+	return nil, fmt.Errorf("failed with status code: %d", resp.StatusCode)
+}
+
+func (dc *DryClient) UpsertSecret(name, value, namespace, tenantId string) error {
+	payload := map[string]interface{}{
+		"secret_name":      name,
+		"secret_value":     value,
+		"secret_namespace": namespace,
+		"secret_tenant":    tenantId,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+		"Content-Type":  "application/json",
+	}
+	endpoint := dc.EngineHost + dc.UpsertSecretEndpoint
+	resp, err := dc.doRequest("POST", endpoint, headers, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (dc *DryClient) DeleteSecret(name, namespace, tenantId string) error {
+	payload := map[string]interface{}{
+		"secret_name":      name,
+		"secret_namespace": namespace,
+		"secret_tenant":    tenantId,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+		"Content-Type":  "application/json",
+	}
+	endpoint := dc.EngineHost + dc.DeleteSecretEndpoint
+	resp, err := dc.doRequest("POST", endpoint, headers, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (dc *DryClient) SyncInfra(triggerOrCronId *DryId) error {
+	endpoint := fmt.Sprintf("%s%s/%s", dc.EngineHost, dc.SyncEndpoint, triggerOrCronId.String())
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+	}
+	resp, err := dc.doRequest("POST", endpoint, headers, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (dc *DryClient) OAuthToken(connectionId *DryId) (string, error) {
+	endpoint := fmt.Sprintf("%s%s/%s", dc.EngineHost, dc.OauthKeyEndpoint, connectionId.String())
+	headers := map[string]string{
+		"Authorization": "Bearer " + dc.APIKey,
+	}
+
+	resp, err := dc.doRequest("GET", endpoint, headers, nil)
+	if err != nil {
+		dc.report(fmt.Sprintf("Failed to retrieve OAuth token for connection %s with error: %v", connectionId, err))
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", err
+		}
+		token, ok := result["access_token"].(string)
+		if !ok {
+			return "", fmt.Errorf("access_token not found in response")
+		}
+		dc.report(fmt.Sprintf("Successfully retrieved OAuth token for connection %s", connectionId))
+		return token, nil
+	}
+
+	dc.report(fmt.Sprintf("Failed to retrieve OAuth token for connection %s with status code %d: %s", connectionId, resp.StatusCode, string(body)))
+	return "", fmt.Errorf("HTTP Error: %d", resp.StatusCode)
 }
